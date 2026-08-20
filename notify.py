@@ -72,3 +72,74 @@ class Telegram:
             else: self.send("Unknown command — /help")
         except Exception as e:
             self.send(f"Command failed: {e}")
+
+class Discord:
+    """
+    Simple Discord webhook notifier — one-way alerts only. No bot token, no
+    hosting, no gateway connection needed: just a webhook URL from a Discord
+    channel's Integrations settings. Does not support remote commands
+    (that needs a real bot with a live gateway connection, not a webhook).
+    """
+    def __init__(self, webhook_url):
+        self.webhook_url = webhook_url
+        self._lock = threading.Lock()
+
+    def send(self, text):
+        if not self.webhook_url:
+            return
+        try:
+            with self._lock:
+                # Discord webhook messages cap at 2000 chars
+                requests.post(self.webhook_url, json={"content": str(text)[:2000]}, timeout=10)
+        except Exception as e:
+            log.warning(f"Discord send failed: {e}")
+
+    def start(self):
+        if self.webhook_url:
+            log.info("Discord webhook enabled (alerts only, no remote commands)")
+
+
+class MultiNotify:
+    """
+    Fans out .send() to every configured channel (Telegram, Discord, both, or
+    neither) so the rest of the bot only ever needs to call notify.send(...)
+    without caring which providers are actually active. Remote commands still
+    route through Telegram specifically, since that's the only provider that
+    supports them.
+    """
+    def __init__(self, channels):
+        self.channels = [c for c in channels if c is not None]
+
+    def send(self, text):
+        for c in self.channels:
+            c.send(text)
+
+    def start(self):
+        for c in self.channels:
+            c.start()
+
+    @property
+    def controller(self):
+        for c in self.channels:
+            if hasattr(c, "controller"):
+                return c.controller
+        return None
+
+    @controller.setter
+    def controller(self, value):
+        for c in self.channels:
+            if hasattr(c, "controller"):
+                c.controller = value
+
+    @property
+    def commands_enabled(self):
+        for c in self.channels:
+            if hasattr(c, "commands_enabled"):
+                return c.commands_enabled
+        return False
+
+    @commands_enabled.setter
+    def commands_enabled(self, value):
+        for c in self.channels:
+            if hasattr(c, "commands_enabled"):
+                c.commands_enabled = value

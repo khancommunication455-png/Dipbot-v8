@@ -312,12 +312,14 @@ def main():
         pos.setdefault("trail_stop_pct", CFG["TRAILING_STOP_PCT"])
 
     # notifications (best effort, never blocks trading)
-    notify = notify_mod.Telegram(CFG["TELEGRAM_BOT_TOKEN"], CFG["TELEGRAM_CHAT_ID"],
-                                 controller=None, commands_enabled=False)
+    telegram = notify_mod.Telegram(CFG["TELEGRAM_BOT_TOKEN"], CFG["TELEGRAM_CHAT_ID"],
+                                    controller=None, commands_enabled=False)
+    discord = notify_mod.Discord(CFG["DISCORD_WEBHOOK_URL"])
+    notify = notify_mod.MultiNotify([telegram, discord])
     controller = Controller(ex, store, state, CFG, notify)
     if CFG["TELEGRAM_BOT_TOKEN"] and CFG["TELEGRAM_CHAT_ID"] and CFG["TELEGRAM_COMMANDS_ENABLED"]:
-        notify.controller = controller
-        notify.commands_enabled = True
+        telegram.controller = controller
+        telegram.commands_enabled = True
     notify.start()
 
     # dashboard first — Render's health check needs the port bound quickly
@@ -422,6 +424,13 @@ def main():
                     # cheap gate FIRST — skip the klines call entirely when blocked
                     open_notional = sum(p["qty"] * shared["last_prices"].get(s, p["buy_price"])
                                         for s, p in state["positions"].items())
+
+                    # Hard $ cap: if the bot's own open positions already total the
+                    # configured budget, don't even bother evaluating this symbol.
+                    remaining_budget = CFG["MAX_BOT_CAPITAL_USDT"] - open_notional
+                    if remaining_budget <= 0:
+                        continue
+
                     ok, why = risk.entry_gate(CFG, state, daily["profit"], shared.get("equity"),
                                               len(state["positions"]), symbol, now)
                     if not ok:
@@ -442,7 +451,15 @@ def main():
                         quote = risk.size_position(CFG, sig["stop_pct"],
                                                    (an or {}).get("atr_pct"), shared.get("equity"),
                                                    shared.get("usdt_free"), ex.min_notional(symbol))
-                        if quote and risk.exposure_ok(CFG, shared.get("equity"), open_notional, quote):
+                        if quote:
+                            # Never let a single trade push total deployed capital past the hard cap
+                            quote = min(quote, remaining_budget)
+                            if quote < ex.min_notional(symbol):
+                                log.info(f"{symbol}: signal skipped — remaining capital (${remaining_budget:.2f}) "
+                                         f"below exchange minimum after applying ${CFG['MAX_BOT_CAPITAL_USDT']:.0f} cap")
+                                quote = None
+                        if quote and risk.capital_cap_ok(CFG, open_notional, quote) \
+                                  and risk.exposure_ok(CFG, shared.get("equity"), open_notional, quote):
                             if do_buy(ex, store, state, CFG, notify, symbol, sig, quote, now):
                                 new_entries += 1
                         elif quote:

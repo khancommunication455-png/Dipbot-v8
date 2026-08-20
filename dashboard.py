@@ -110,6 +110,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="card"><div class="label">Win Rate</div><div class="value" id="winrate">--</div></div>
     <div class="card"><div class="label">Closed / Open</div><div class="value" id="co">--</div></div>
     <div class="card"><div class="label">Exposure</div><div class="value" id="exposure">--</div></div>
+    <div class="card"><div class="label">Capital Budget Left</div><div class="value" id="budget">--</div></div>
     <div class="card"><div class="label">Loops</div><div class="value" id="loops">--</div></div>
     <div class="card"><div class="label">Drawdown</div><div class="value" id="dd">--</div></div>
   </div>
@@ -214,6 +215,7 @@ async function refresh(){
     setVal('winrate',fmt(status.win_rate,1)+'%');
     document.getElementById('co').textContent=status.closed_trades+' / '+status.open_positions+' of '+status.max_positions;
     document.getElementById('exposure').textContent='$'+fmt(status.exposure_usdt)+(status.exposure_pct!==null?' ('+fmt(status.exposure_pct,0)+'%)':'');
+    document.getElementById('budget').textContent='$'+fmt(status.remaining_capital_usdt,2)+' of $'+fmt(status.max_bot_capital_usdt,0)+' cap';
     document.getElementById('loops').textContent=status.loops_completed;
     setVal('dd',status.drawdown_pct===null?'--':'-'+fmt(status.drawdown_pct,1)+'%',-(status.drawdown_pct||0));
     document.getElementById('watching-foot').textContent='watching '+status.watchlist_size+(status.market_scan_enabled?' (auto-scan)':' (fixed)')+' pairs · up since '+new Date(status.started_at).toLocaleString();
@@ -286,7 +288,7 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         cfg, shared, store = _ctx["cfg"], _ctx["shared"], _ctx["store"]
         if path in ("/", "/dashboard"):
-self._html(DASHBOARD_HTML); return
+            self._html(DASHBOARD_HTML); return
         if path == "/api/status":
             with _ctx["state_lock"]:
                 positions = {s: dict(p) for s, p in _ctx["state"]["positions"].items()}
@@ -306,6 +308,7 @@ self._html(DASHBOARD_HTML); return
             if dd is not None and dd >= cfg["MAX_DRAWDOWN_PCT"]: circuits.append("max drawdown")
             cg = shared.get("crash_guard_until")
             if cg and datetime.fromisoformat(cg) > datetime.utcnow(): circuits.append("crash guard")
+            if exposure >= cfg["MAX_BOT_CAPITAL_USDT"]: circuits.append(f"capital cap (${cfg['MAX_BOT_CAPITAL_USDT']:.0f}) reached")
             self._json({
                 "status": "alive", "testnet": cfg["USE_TESTNET"],
                 "started_at": shared.get("started_at"), "last_check": shared.get("last_check"),
@@ -317,6 +320,8 @@ self._html(DASHBOARD_HTML); return
                 "peak_equity": peak, "drawdown_pct": dd,
                 "exposure_usdt": exposure,
                 "exposure_pct": (exposure/equity*100) if equity else None,
+                "max_bot_capital_usdt": cfg["MAX_BOT_CAPITAL_USDT"],
+                "remaining_capital_usdt": max(0, cfg["MAX_BOT_CAPITAL_USDT"] - exposure),
                 "paused": shared.get("paused", False), "circuits": circuits,
                 "market_scan_enabled": cfg["MARKET_SCAN_ENABLED"],
                 "watchlist_size": len(shared.get("watchlist") or []),

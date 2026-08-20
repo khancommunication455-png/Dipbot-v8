@@ -38,6 +38,14 @@ CFG = {
     "MAX_CONCURRENT_POSITIONS": _i("MAX_CONCURRENT_POSITIONS", 3),
     "POSITION_SIZE_USDT": _f("POSITION_SIZE_USDT", 10),
 
+    # --- hard capital cap (independent of account equity) ---
+    # On testnet, get_account() returns ~35 free faucet coins worth thousands of
+    # fake dollars, which the equity-based exposure_ok() check would otherwise use.
+    # This is a separate, absolute ceiling on how much the BOT ITSELF will ever
+    # have deployed across open positions — once open positions total this amount,
+    # no new entries fire, regardless of what the wallet's total equity says.
+    "MAX_BOT_CAPITAL_USDT": _f("MAX_BOT_CAPITAL_USDT", 30),
+
     # --- fees / execution ---
     "FEE_RATE": _f("FEE_RATE", 0.001),
     "MAKER_ORDERS_ENABLED": _b("MAKER_ORDERS_ENABLED", False),
@@ -125,6 +133,13 @@ CFG = {
     "TELEGRAM_CHAT_ID": _s("TELEGRAM_CHAT_ID", ""),
     "TELEGRAM_COMMANDS_ENABLED": _b("TELEGRAM_COMMANDS_ENABLED", True),
 
+    # --- discord (optional, alerts only) ---
+    # Simple webhook — no bot token/hosting needed. One-way: Discord gets the
+    # same alerts Telegram would, but remote commands (/pause, /close, etc.)
+    # still need Telegram since those require a live two-way bot connection
+    # a webhook can't provide.
+    "DISCORD_WEBHOOK_URL": _s("DISCORD_WEBHOOK_URL", ""),
+
     # --- backtester-only ---
     "SLIPPAGE_BPS": _f("SLIPPAGE_BPS", 5),
     "STARTING_EQUITY": _f("STARTING_EQUITY", 1000),
@@ -159,6 +174,13 @@ def validate(strict=True):
         if c[k] <= 0: errors.append(f"{k} must be > 0")
     if c["POSITION_SIZE_USDT"] < 5:
         warns.append("POSITION_SIZE_USDT below typical exchange minimum ($5) — orders will be skipped")
+    if c["MAX_BOT_CAPITAL_USDT"] <= 0:
+        errors.append("MAX_BOT_CAPITAL_USDT must be > 0")
+    if c["POSITION_SIZE_USDT"] > c["MAX_BOT_CAPITAL_USDT"]:
+        warns.append(
+            f"POSITION_SIZE_USDT (${c['POSITION_SIZE_USDT']}) exceeds MAX_BOT_CAPITAL_USDT "
+            f"(${c['MAX_BOT_CAPITAL_USDT']}) — even a single position would breach the cap"
+        )
     if not c["USE_TESTNET"]:
         warns.append("USE_TESTNET=false — LIVE TRADING with real money")
         if not c["CONTROL_TOKEN"]:

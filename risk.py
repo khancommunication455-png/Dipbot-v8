@@ -27,6 +27,19 @@ def exposure_ok(cfg, equity, open_notional, add_usdt):
     if not equity or cfg["MAX_TOTAL_EXPOSURE_PCT"] <= 0: return True
     return open_notional + add_usdt <= equity * cfg["MAX_TOTAL_EXPOSURE_PCT"] / 100
 
+def capital_cap_ok(cfg, open_notional, add_usdt):
+    """
+    Hard absolute ceiling on total capital the bot deploys, independent of
+    account equity (which on testnet includes faucet-granted balances worth
+    far more than the user's actual intended budget). Once open positions'
+    total value reaches MAX_BOT_CAPITAL_USDT, no new entries are allowed —
+    trading only resumes as existing positions close and free up room.
+    """
+    cap = cfg["MAX_BOT_CAPITAL_USDT"]
+    if cap <= 0:
+        return True  # cap disabled
+    return open_notional + add_usdt <= cap
+
 def size_position(cfg, stop_pct, atr_pct, equity, usdt_free, min_notional):
     """Risk-based sizing: position shrinks so each trade risks ~RISK_PER_TRADE_PCT
     of equity at its stop distance, with an inverse-volatility cap and hard
