@@ -15,6 +15,7 @@ from collections import deque
 from datetime import datetime, timedelta
 
 from binance.client import Client
+from binance.exceptions import BinanceAPIException
 
 import dashboard
 import datastore
@@ -281,6 +282,28 @@ def reconcile_positions(ex, store, state, cfg):
 
 # ---------------- main ----------------
 
+def _connect_with_retry(max_attempts=6):
+    """
+    The raw Binance Client() constructor calls self.ping() synchronously, which
+    can hit a temporary rate-limit ban (code -1003). Without retrying here, that
+    crashes the whole process — and on a platform that auto-restarts crashed
+    processes, an immediate restart just retries into the SAME still-active ban,
+    creating a rapid crash loop that looks like repeated fresh bans in the logs.
+    This waits out the ban with exponential backoff instead of crashing.
+    """
+    delay = 5
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return Client(CFG["API_KEY"], CFG["API_SECRET"], testnet=CFG["USE_TESTNET"])
+        except BinanceAPIException as e:
+            if attempt == max_attempts:
+                log.error(f"Failed to connect to Binance after {max_attempts} attempts: {e}")
+                raise
+            log.warning(f"Binance connection attempt {attempt}/{max_attempts} failed ({e}); retrying in {delay}s...")
+            time.sleep(delay)
+            delay = min(delay * 2, 120)  # cap backoff at 2 minutes
+
+
 def main():
     errors, warns = validate(strict=True)
     for w in warns: log.warning(f"CONFIG WARNING: {w}")
@@ -288,7 +311,20 @@ def main():
         for e in errors: log.error(f"CONFIG ERROR: {e}")
         raise SystemExit(1)
 
-    client = Client(CFG["API_KEY"], CFG["API_SECRET"], testnet=CFG["USE_TESTNET"])
+    # Start the dashboard/health-check server FIRST, before anything that can
+    # block for minutes (the Binance connection retry loop below). Fly/Render
+    # need to see the port bound quickly or they'll mark the deploy unhealthy —
+    # this bit us before when a rate-limit ban meant nothing was listening on
+    # the expected port for the whole retry window. init_dashboard() is called
+    # again below once store/controller actually exist; the dashboard just
+    # shows "connecting..." in the meantime instead of the port being dark.
+    shared["status"] = "connecting to Binance..."
+    dashboard.init_dashboard(None, None, CFG, shared, {"positions": {}, "trade_log": []},
+                              state_lock, _log_buffer, _log_lock)
+    threading.Thread(target=dashboard.start_server, args=(CFG["PORT"],), daemon=True).start()
+    log.info(f"Dashboard listening on port {CFG['PORT']} (connecting to Binance next, this can take a moment)")
+
+    client = _connect_with_retry()
     ex = Exchange(client, fee_rate=CFG["FEE_RATE"])
     log.info(f"Connected to Binance {'TESTNET' if CFG['USE_TESTNET'] else 'LIVE'}.")
 
@@ -322,10 +358,10 @@ def main():
         telegram.commands_enabled = True
     notify.start()
 
-    # dashboard first — Render's health check needs the port bound quickly
+    # Now that store/controller/state are real, wire the dashboard up to the
+    # actual running bot instead of the placeholder shown while connecting.
     dashboard.init_dashboard(store, controller, CFG, shared, state, state_lock, _log_buffer, _log_lock)
-    threading.Thread(target=dashboard.start_server, args=(CFG["PORT"],), daemon=True).start()
-    log.info(f"Dashboard listening on port {CFG['PORT']}")
+    shared["status"] = "running"
 
     # graceful shutdown: Render sends SIGTERM on redeploys
     def _sig(signum, frame):
@@ -363,124 +399,137 @@ def main():
 
     loop_count = 0
     while not _shutdown["flag"]:
-        if CFG["MARKET_SCAN_ENABLED"] and loop_count > 0 and loop_count % CFG["MARKET_SCAN_REFRESH_LOOPS"] == 0:
-            scanned = get_active_symbols(ex, CFG)
-            if scanned:
-                active_symbols = scanned
-                shared["watchlist"] = active_symbols
+        try:
+            if CFG["MARKET_SCAN_ENABLED"] and loop_count > 0 and loop_count % CFG["MARKET_SCAN_REFRESH_LOOPS"] == 0:
+                scanned = get_active_symbols(ex, CFG)
+                if scanned:
+                    active_symbols = scanned
+                    shared["watchlist"] = active_symbols
 
-        all_prices = ex.get_all_prices()
-        if all_prices is None:
-            log.warning("Price fetch failed — backing off one interval.")
-            time.sleep(CFG["CHECK_INTERVAL_SEC"]); loop_count += 1; continue
+            all_prices = ex.get_all_prices()
+            if all_prices is None:
+                log.warning("Price fetch failed — backing off one interval.")
+                time.sleep(CFG["CHECK_INTERVAL_SEC"]); loop_count += 1; continue
 
-        now = datetime.utcnow()
-        today = now.date().isoformat()
+            now = datetime.utcnow()
+            today = now.date().isoformat()
 
-        # account equity / drawdown tracking / daily summary — every 5 loops
-        if loop_count % 5 == 0:
-            try:
-                equity, usdt_free = compute_equity(ex, all_prices)
-                if equity is not None:
-                    shared["equity"], shared["usdt_free"] = equity, usdt_free
-                    peak = state.get("peak_equity") or equity
-                    state["peak_equity"] = max(peak, equity)
-                    shared["peak_equity"] = state["peak_equity"]
-            except Exception as e:
-                log.error(f"Equity fetch failed: {e}")
-            risk.check_crash_guard(ex, CFG, state, now)
-            # daily Telegram summary on UTC day rollover
-            if state.get("last_summary_day") and state["last_summary_day"] != today:
-                d = store.daily_summary(state["last_summary_day"])
-                if d["closed"]:
-                    notify.send(f"📅 {state['last_summary_day']}: {d['closed']} closed trades, "
-                                f"P/L ${d['profit']:.4f}, {d['wins']}/{d['closed']} wins")
-            state["last_summary_day"] = today
+            # account equity / drawdown tracking / daily summary — every 5 loops
+            if loop_count % 5 == 0:
+                try:
+                    equity, usdt_free = compute_equity(ex, all_prices)
+                    if equity is not None:
+                        shared["equity"], shared["usdt_free"] = equity, usdt_free
+                        peak = state.get("peak_equity") or equity
+                        state["peak_equity"] = max(peak, equity)
+                        shared["peak_equity"] = state["peak_equity"]
+                except Exception as e:
+                    log.error(f"Equity fetch failed: {e}")
+                risk.check_crash_guard(ex, CFG, state, now)
+                # daily Telegram summary on UTC day rollover
+                if state.get("last_summary_day") and state["last_summary_day"] != today:
+                    d = store.daily_summary(state["last_summary_day"])
+                    if d["closed"]:
+                        notify.send(f"📅 {state['last_summary_day']}: {d['closed']} closed trades, "
+                                    f"P/L ${d['profit']:.4f}, {d['wins']}/{d['closed']} wins")
+                state["last_summary_day"] = today
 
-        daily = store.daily_summary(today)
-        shared["paused"] = state.get("paused", False)
-        shared["crash_guard_until"] = state.get("crash_guard_until")
+            daily = store.daily_summary(today)
+            shared["paused"] = state.get("paused", False)
+            shared["crash_guard_until"] = state.get("crash_guard_until")
 
-        new_entries = 0
-        for symbol in active_symbols:
-            if _shutdown["flag"]: break
-            price = all_prices.get(symbol)
-            if price is None: continue
-            shared["last_prices"][symbol] = price
+            new_entries = 0
+            for symbol in active_symbols:
+                if _shutdown["flag"]: break
+                price = all_prices.get(symbol)
+                if price is None: continue
+                shared["last_prices"][symbol] = price
 
-            with state_lock:
-                update_price_history(state, symbol, price)
-                if symbol in state["positions"]:
-                    raw = ex.get_klines(symbol, CFG["KLINE_INTERVAL"], CFG["INDICATOR_LIMIT"])
-                    an = compute_indicators(raw, CFG) if raw else None
-                    pos = state["positions"][symbol]
-                    act = strategies.evaluate_exits(pos, price, an, now, CFG)
-                    if act:
-                        if act[0] == "partial":
-                            do_partial(ex, store, state, CFG, notify, symbol, act[1], act[2], now)
-                        else:
-                            do_sell(ex, store, state, CFG, notify, symbol, act[1], now)
-                else:
-                    # cheap gate FIRST — skip the klines call entirely when blocked
-                    open_notional = sum(p["qty"] * shared["last_prices"].get(s, p["buy_price"])
-                                        for s, p in state["positions"].items())
+                with state_lock:
+                    update_price_history(state, symbol, price)
+                    if symbol in state["positions"]:
+                        raw = ex.get_klines(symbol, CFG["KLINE_INTERVAL"], CFG["INDICATOR_LIMIT"])
+                        an = compute_indicators(raw, CFG) if raw else None
+                        pos = state["positions"][symbol]
+                        act = strategies.evaluate_exits(pos, price, an, now, CFG)
+                        if act:
+                            if act[0] == "partial":
+                                do_partial(ex, store, state, CFG, notify, symbol, act[1], act[2], now)
+                            else:
+                                do_sell(ex, store, state, CFG, notify, symbol, act[1], now)
+                    else:
+                        # cheap gate FIRST — skip the klines call entirely when blocked
+                        open_notional = sum(p["qty"] * shared["last_prices"].get(s, p["buy_price"])
+                                            for s, p in state["positions"].items())
 
-                    # Hard $ cap: if the bot's own open positions already total the
-                    # configured budget, don't even bother evaluating this symbol.
-                    remaining_budget = CFG["MAX_BOT_CAPITAL_USDT"] - open_notional
-                    if remaining_budget <= 0:
-                        continue
+                        # Hard $ cap: if the bot's own open positions already total the
+                        # configured budget, don't even bother evaluating this symbol.
+                        remaining_budget = CFG["MAX_BOT_CAPITAL_USDT"] - open_notional
+                        if remaining_budget <= 0:
+                            continue
 
-                    ok, why = risk.entry_gate(CFG, state, daily["profit"], shared.get("equity"),
-                                              len(state["positions"]), symbol, now)
-                    if not ok:
-                        continue
-                    raw = ex.get_klines(symbol, CFG["KLINE_INTERVAL"], CFG["INDICATOR_LIMIT"])
-                    an = compute_indicators(raw, CFG) if raw else None
-                    ctx = {"symbol": symbol, "price": price, "an": an, "cfg": CFG,
-                           "rolling_high": rolling_high(state, symbol),
-                           "multiplier": strategies.adaptive_multiplier(state["symbol_stats"], symbol, CFG)}
-                    sig = None
-                    for fn in strategies.ENTRY_STRATEGIES:
-                        sig = fn(ctx)
-                        if sig: break
-                    if sig and CFG["MTF_ENABLED"] and not mtf_ok(ex, CFG, symbol, price):
-                        log.info(f"{symbol}: {sig['strategy']} signal vetoed by {CFG['MTF_INTERVAL']} trend filter")
+                        ok, why = risk.entry_gate(CFG, state, daily["profit"], shared.get("equity"),
+                                                  len(state["positions"]), symbol, now)
+                        if not ok:
+                            continue
+                        raw = ex.get_klines(symbol, CFG["KLINE_INTERVAL"], CFG["INDICATOR_LIMIT"])
+                        an = compute_indicators(raw, CFG) if raw else None
+                        ctx = {"symbol": symbol, "price": price, "an": an, "cfg": CFG,
+                               "rolling_high": rolling_high(state, symbol),
+                               "multiplier": strategies.adaptive_multiplier(state["symbol_stats"], symbol, CFG)}
                         sig = None
-                    if sig:
-                        quote = risk.size_position(CFG, sig["stop_pct"],
-                                                   (an or {}).get("atr_pct"), shared.get("equity"),
-                                                   shared.get("usdt_free"), ex.min_notional(symbol))
-                        if quote:
-                            # Never let a single trade push total deployed capital past the hard cap
-                            quote = min(quote, remaining_budget)
-                            if quote < ex.min_notional(symbol):
-                                log.info(f"{symbol}: signal skipped — remaining capital (${remaining_budget:.2f}) "
-                                         f"below exchange minimum after applying ${CFG['MAX_BOT_CAPITAL_USDT']:.0f} cap")
-                                quote = None
-                        if quote and risk.capital_cap_ok(CFG, open_notional, quote) \
-                                  and risk.exposure_ok(CFG, shared.get("equity"), open_notional, quote):
-                            if do_buy(ex, store, state, CFG, notify, symbol, sig, quote, now):
-                                new_entries += 1
-                        elif quote:
-                            log.info(f"{symbol}: signal skipped — total exposure cap")
+                        for fn in strategies.ENTRY_STRATEGIES:
+                            sig = fn(ctx)
+                            if sig: break
+                        if sig and CFG["MTF_ENABLED"] and not mtf_ok(ex, CFG, symbol, price):
+                            log.info(f"{symbol}: {sig['strategy']} signal vetoed by {CFG['MTF_INTERVAL']} trend filter")
+                            sig = None
+                        if sig:
+                            quote = risk.size_position(CFG, sig["stop_pct"],
+                                                       (an or {}).get("atr_pct"), shared.get("equity"),
+                                                       shared.get("usdt_free"), ex.min_notional(symbol))
+                            if quote:
+                                # Never let a single trade push total deployed capital past the hard cap
+                                quote = min(quote, remaining_budget)
+                                if quote < ex.min_notional(symbol):
+                                    log.info(f"{symbol}: signal skipped — remaining capital (${remaining_budget:.2f}) "
+                                             f"below exchange minimum after applying ${CFG['MAX_BOT_CAPITAL_USDT']:.0f} cap")
+                                    quote = None
+                            if quote and risk.capital_cap_ok(CFG, open_notional, quote) \
+                                      and risk.exposure_ok(CFG, shared.get("equity"), open_notional, quote):
+                                if do_buy(ex, store, state, CFG, notify, symbol, sig, quote, now):
+                                    new_entries += 1
+                            elif quote:
+                                log.info(f"{symbol}: signal skipped — total exposure cap")
 
-            store.save_bot_state(state)
+                store.save_bot_state(state)
 
-        loop_count += 1
-        shared["loops"] = loop_count
-        shared["last_check"] = datetime.utcnow().isoformat()
-        log.info(f"Loop {loop_count}: {len(active_symbols)} symbols | entries +{new_entries} | "
-                 f"open {len(state['positions'])}/{CFG['MAX_CONCURRENT_POSITIONS']}"
-                 + (" | PAUSED" if state.get("paused") else ""))
-        if loop_count % 10 == 0:
-            t = store.profit_summary()
-            log.info(f"--- {t['closed']} closed trades | net ${t['profit']:.4f} | "
-                     f"win rate {(t['wins']/t['closed']*100) if t['closed'] else 0:.1f}% ---")
-        # sleep in 1s slices so SIGTERM responds quickly
-        for _ in range(CFG["CHECK_INTERVAL_SEC"]):
-            if _shutdown["flag"]: break
-            time.sleep(1)
+            loop_count += 1
+            shared["loops"] = loop_count
+            shared["last_check"] = datetime.utcnow().isoformat()
+            log.info(f"Loop {loop_count}: {len(active_symbols)} symbols | entries +{new_entries} | "
+                     f"open {len(state['positions'])}/{CFG['MAX_CONCURRENT_POSITIONS']}"
+                     + (" | PAUSED" if state.get("paused") else ""))
+            if loop_count % 10 == 0:
+                t = store.profit_summary()
+                log.info(f"--- {t['closed']} closed trades | net ${t['profit']:.4f} | "
+                         f"win rate {(t['wins']/t['closed']*100) if t['closed'] else 0:.1f}% ---")
+            # sleep in 1s slices so SIGTERM responds quickly
+            for _ in range(CFG["CHECK_INTERVAL_SEC"]):
+                if _shutdown["flag"]: break
+                time.sleep(1)
+        except Exception as e:
+            # A single bad loop iteration (rate limit, network blip, unexpected API
+            # response, etc.) must NEVER crash the whole process — that turned into
+            # a real multi-hour outage once before, when an uncaught exception here
+            # propagated up, killed the bot, and Fly.io eventually gave up restarting
+            # it after hitting its max-restart count. Log it, skip this iteration,
+            # and try again next cycle instead.
+            log.error(f"Unhandled error in main loop (iteration skipped, will retry next cycle): {e}", exc_info=True)
+            loop_count += 1
+            for _ in range(CFG["CHECK_INTERVAL_SEC"]):
+                if _shutdown["flag"]: break
+                time.sleep(1)
 
     store.save_bot_state(state)
     log.info("Shutdown complete — state saved.")

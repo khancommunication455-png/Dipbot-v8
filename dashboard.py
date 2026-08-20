@@ -289,6 +289,12 @@ class Handler(BaseHTTPRequestHandler):
         cfg, shared, store = _ctx["cfg"], _ctx["shared"], _ctx["store"]
         if path in ("/", "/dashboard"):
             self._html(DASHBOARD_HTML); return
+        if store is None:
+            # Still connecting to Binance (can take a while if retrying through
+            # a rate-limit ban) — the static dashboard page above works fine,
+            # but data endpoints have nothing real to serve yet.
+            self._json({"status": shared.get("status", "starting"), "message": "Bot is starting up, connecting to exchange..."})
+            return
         if path == "/api/status":
             with _ctx["state_lock"]:
                 positions = {s: dict(p) for s, p in _ctx["state"]["positions"].items()}
@@ -361,6 +367,8 @@ class Handler(BaseHTTPRequestHandler):
             if not self._authorized(body):
                 return self._json({"ok": False, "msg": "unauthorized — set CONTROL_TOKEN"}, 401)
             c = _ctx["controller"]
+            if c is None:
+                return self._json({"ok": False, "msg": "bot is still starting up, try again shortly"}, 503)
             if path == "/api/close":
                 r = c.close_all() if body.get("all") else c.close_symbol(body.get("symbol") or "")
                 return self._json(r)
